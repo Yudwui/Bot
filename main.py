@@ -1,106 +1,94 @@
 import asyncio
 import logging
-import time
-import aiohttp
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command, CommandObject
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
 # Токен вашего бота
 TOKEN = "8844284513:AAHB1BBs_nE8Zfu72EPomPa28EJtknKcoZI"
 
-dp = Dispatcher()
+# Инициализируем хранилище состояний в памяти
+dp = Dispatcher(storage=MemoryStorage())
 
-# Кэш для курсов валют (храним 5 минут = 300 секунд)
-cache = {
-    "data": None,
-    "timestamp": 0
-}
-CACHE_TTL = 300
+# Описываем шаги состояний для опросника (FSM)
+class SurveyStates(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_age = State()
+    waiting_for_occupation = State()
 
-async def get_exchange_rates():
-    """Получает курсы валют с внешнего API с учетом кэширования на 5 минут"""
-    current_time = time.time()
-    if cache["data"] and (current_time - cache["timestamp"] < CACHE_TTL):
-        return cache["data"]
-    
-    # Используем бесплатное открытое API для курсов валют
-    url = "https://open.er-api.com/v6/latest/USD"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    cache["data"] = data.get("rates", {})
-                    cache["timestamp"] = current_time
-                    return cache["data"]
-    except Exception as e:
-        logging.error(f"Ошибка запроса к API: {e}")
-    return None
-
+# Команда /start запускает опрос
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="USD -> RUB", callback_data="rate_USD_RUB")
-    builder.button(text="EUR -> RUB", callback_data="rate_EUR_RUB")
-    builder.button(text="EUR -> USD", callback_data="rate_EUR_USD")
-    builder.adjust(2)
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear() # Сбрасываем старые состояния, если были
+    builder = ReplyKeyboardBuilder()
+    builder.button(text="/cancel")
     
     await message.answer(
-        "Привет! Я бот-конвертер валют.\n"
-        "Используй команду в формате: `/rate USD RUB`\n"
-        "Или выбери популярную пару на кнопках ниже:",
-        reply_markup=builder.as_markup()
+        "Привет! Давайте пройдем небольшой опрос.\n"
+        "Как вас зовут?\n\n"
+        "*(Вы можете в любой момент прервать опрос командой `/cancel`)*",
+        reply_markup=builder.as_markup(resize_keyboard=True)
+    )
+    # Переходим к состоянию ожидания имени
+    await state.set_state(SurveyStates.waiting_for_name)
+
+# Команда /cancel для прерывания опроса
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "❌ Опрос прерван. Чтобы начать заново, введите `/start`.",
+        reply_markup=types.ReplyKeyboardRemove()
     )
 
-@dp.message(Command("rate"))
-async def cmd_rate(message: types.Message, command: CommandObject):
-    if not command.args:
-        await message.answer("⚠️ Пожалуйста, укажите валютную пару. Пример: `/rate USD RUB`")
-        return
-    
-    args = command.args.upper().split()
-    if len(args) != 2:
-        await message.answer("⚠️ Неверный формат! Используйте два кода валют, например: `/rate USD RUB`")
-        return
-    
-    base, target = args[0], args[1]
-    rates = await get_exchange_rates()
-    
-    if not rates:
-        await message.answer("❌ Не удалось получить данные от сервера валют. Попробуйте позже.")
-        return
-    
-    if base not in rates or target not in rates:
-        await message.answer(f"❌ Ошибка: одна из валют (`{base}` или `{target}`) не найдена или не поддерживается.")
-        return
-    
-    # Расчет кросс-курса через USD
-    try:
-        base_rate = 1.0 if base == "USD" else rates.get(base)
-        target_rate = 1.0 if target == "USD" else rates.get(target)
+# Получаем имя
+@dp.message(SurveyStates.waiting_for_name)
+async def process_name(message: types.Message, state: FSMContext):
+    if message.text.startswith("/"):
+        return # Если пользователь ввел команду вместо имени
         
-        result = target_rate / base_rate if base != "USD" else target_rate
-        
-        await message.answer(f"💱 Текущий курс: **1 {base} = {result:.4f} {target}**")
-    except Exception:
-        await message.answer("❌ Произошла ошибка при расчете курса.")
+    await state.update_data(name=message.text)
+    await message.answer(f"Приятно познакомиться, {message.text}!\nСколько вам лет?")
+    await state.set_state(SurveyStates.waiting_for_age)
 
-@dp.callback_query(F.data.startswith("rate_"))
-async def inline_rate_handler(callback: types.CallbackQuery):
-    _, base, target = callback.data.split("_")
-    rates = await get_exchange_rates()
-    
-    if not rates:
-        await callback.answer("Ошибка получения данных", show_alert=True)
+# Получаем возраст
+@dp.message(SurveyStates.waiting_for_age)
+async def process_age(message: types.Message, state: FSMContext):
+    if message.text.startswith("/"):
         return
         
-    base_rate = 1.0 if base == "USD" else rates.get(base)
-    target_rate = 1.0 if target == "USD" else rates.get(target)
-    result = target_rate / base_rate if base != "USD" else target_rate
+    if not message.text.isdigit():
+        await message.answer("⚠️ Пожалуйста, введите возраст цифрами:")
+        return
+        
+    await state.update_data(age=message.text)
+    await message.answer("Чем вы занимаетесь? (ваша профессия или увлечение):")
+    await state.set_state(SurveyStates.waiting_for_occupation)
+
+# Получаем сферу деятельности и подводим итоги
+@dp.message(SurveyStates.waiting_for_occupation)
+async def process_occupation(message: types.Message, state: FSMContext):
+    if message.text.startswith("/"):
+        return
+        
+    await state.update_data(occupation=message.text)
     
-    await callback.answer()
-    await callback.message.answer(f"💱 Курс по кнопке: **1 {base} = {result:.4f} {target}**")
+    # Получаем все сохраненные данные из памяти (FSM)
+    data = await state.get_data()
+    
+    summary = (
+        "✅ **Спасибо за прохождение опроса!**\n\n"
+        f"👤 **Имя:** {data.get('name')}\n"
+        f"🎂 **Возраст:** {data.get('age')}\n"
+        f"💼 **Занятие:** {data.get('occupation')}"
+    )
+    
+    await message.answer(summary, reply_markup=types.ReplyKeyboardRemove())
+    # Очищаем состояние
+    await state.clear()
 
 async def main():
     bot = Bot(token=TOKEN)
