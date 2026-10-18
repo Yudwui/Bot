@@ -1,96 +1,128 @@
 import asyncio
 import logging
+import sqlite3
+from datetime import datetime
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
 # Токен вашего бота
 TOKEN = "8844284513:AAHB1BBs_nE8Zfu72EPomPa28EJtknKcoZI"
 
-# Инициализируем хранилище состояний в памяти
-dp = Dispatcher(storage=MemoryStorage())
+# ID администратора (замените на ваш Telegram user_id, чтобы тестировать команду /users)
+ADMIN_ID = 8265983880  # Укажите сюда свой ID, если знаете, или оставьте число для примера
 
-# Описываем шаги состояний для опросника (FSM)
-class SurveyStates(StatesGroup):
-    waiting_for_name = State()
-    waiting_for_age = State()
-    waiting_for_occupation = State()
+dp = Dispatcher()
 
-# Команда /start запускает опрос
+# --- РАБОТА С БАЗОЙ ДАННЫХ SQLite ---
+def init_db():
+    """Создаёт таблицу пользователей, если её ещё нет"""
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            registered_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def register_user(user: types.User):
+    """Сохраняет пользователя в базу данных при первом обращении"""
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    
+    # Проверяем, есть ли пользователь в базе
+    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user.id,))
+    existing_user = cursor.fetchone()
+    
+    if not existing_user:
+        reg_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute(
+            "INSERT INTO users (user_id, username, first_name, registered_at) VALUES (?, ?, ?, ?)",
+            (user.id, user.username or "отсутствует", user.first_name, reg_date)
+        )
+        conn.commit()
+    conn.close()
+
+# --- ОБРАБОТЧИКИ КОМАНД ---
+
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear() # Сбрасываем старые состояния, если были
-    builder = ReplyKeyboardBuilder()
-    builder.button(text="/cancel")
+async def cmd_start(message: types.Message):
+    # Регистрируем пользователя в базе при старте
+    register_user(message.from_user)
     
     await message.answer(
-        "Привет! Давайте пройдем небольшой опрос.\n"
-        "Как вас зовут?\n\n"
-        "*(Вы можете в любой момент прервать опрос командой `/cancel`)*",
-        reply_markup=builder.as_markup(resize_keyboard=True)
-    )
-    # Переходим к состоянию ожидания имени
-    await state.set_state(SurveyStates.waiting_for_name)
-
-# Команда /cancel для прерывания опроса
-@dp.message(Command("cancel"))
-async def cmd_cancel(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "❌ Опрос прерван. Чтобы начать заново, введите `/start`.",
-        reply_markup=types.ReplyKeyboardRemove()
+        f"Привет, {message.from_user.first_name}!\n"
+        "Я бот с подключенной базой данных SQLite 🗄️\n\n"
+        "Доступные команды:\n"
+        "📊 `/stats` — общая статистика пользователей\n"
+        "👤 `/profile` — ваш профиль\n"
+        "👑 `/users` — список всех пользователей (только для админа)"
     )
 
-# Получаем имя
-@dp.message(SurveyStates.waiting_for_name)
-async def process_name(message: types.Message, state: FSMContext):
-    if message.text.startswith("/"):
-        return # Если пользователь ввел команду вместо имени
-        
-    await state.update_data(name=message.text)
-    await message.answer(f"Приятно познакомиться, {message.text}!\nСколько вам лет?")
-    await state.set_state(SurveyStates.waiting_for_age)
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    register_user(message.from_user)
+    
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM users")
+    count = cursor.fetchone()[0]
+    conn.close()
+    
+    await message.answer(f"📊 **Статистика бота:**\nВсего зарегистрированных пользователей: `{count}`")
 
-# Получаем возраст
-@dp.message(SurveyStates.waiting_for_age)
-async def process_age(message: types.Message, state: FSMContext):
-    if message.text.startswith("/"):
-        return
-        
-    if not message.text.isdigit():
-        await message.answer("⚠️ Пожалуйста, введите возраст цифрами:")
-        return
-        
-    await state.update_data(age=message.text)
-    await message.answer("Чем вы занимаетесь? (ваша профессия или увлечение):")
-    await state.set_state(SurveyStates.waiting_for_occupation)
+@dp.message(Command("profile"))
+async def cmd_profile(message: types.Message):
+    register_user(message.from_user)
+    
+    user_id = message.from_user.id
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT username, first_name, registered_at FROM users WHERE user_id = ?", (user_id,))
+    user_data = cursor.fetchone()
+    conn.close()
+    
+    if user_data:
+        username, first_name, reg_date = user_data
+        await message.answer(
+            f"👤 **Ваш профиль:**\n\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"📛 Имя: {first_name}\n"
+            f"🔗 Username: @{username}\n"
+            f"📅 Дата регистрации: {reg_date}"
+        )
+    else:
+        await message.answer("❌ Информация о вас не найдена в базе данных.")
 
-# Получаем сферу деятельности и подводим итоги
-@dp.message(SurveyStates.waiting_for_occupation)
-async def process_occupation(message: types.Message, state: FSMContext):
-    if message.text.startswith("/"):
+@dp.message(Command("users"))
+async def cmd_users(message: types.Message):
+    register_user(message.from_user)
+    
+    # Проверка на администратора
+    if message.from_user.id != ADMIN_ID:
+        await message.answer(f"⛔ У вас нет прав администратора! Ваш ID: `{message.from_user.id}` (добавьте его в переменную ADMIN_ID в коде).")
         return
         
-    await state.update_data(occupation=message.text)
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, username, first_name, registered_at FROM users")
+    all_users = cursor.fetchall()
+    conn.close()
     
-    # Получаем все сохраненные данные из памяти (FSM)
-    data = await state.get_data()
-    
-    summary = (
-        "✅ **Спасибо за прохождение опроса!**\n\n"
-        f"👤 **Имя:** {data.get('name')}\n"
-        f"🎂 **Возраст:** {data.get('age')}\n"
-        f"💼 **Занятие:** {data.get('occupation')}"
-    )
-    
-    await message.answer(summary, reply_markup=types.ReplyKeyboardRemove())
-    # Очищаем состояние
-    await state.clear()
+    response = "👑 **Список всех пользователей:**\n\n"
+    for u in all_users:
+        response += f"• `{u[0]}` | @{u[1]} | {u[2]} (зарегистрирован: {u[3]})\n"
+        
+    await message.answer(response)
 
 async def main():
+    # Инициализируем базу данных при запуске
+    init_db()
+    
     bot = Bot(token=TOKEN)
     logging.basicConfig(level=logging.INFO)
     await dp.start_polling(bot)
